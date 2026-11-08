@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -2415,18 +2416,31 @@ void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
     // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
     // queued behind the pending report writes instead. On the split's back the fence's
     // submission may be deferred, and the fencing thread would wait for this thread to submit it.
-    std::mutex wait_mutex;
-    std::condition_variable wait_cv;
-    bool written{};
-    fence_manager.SyncOperation([&] {
-        std::scoped_lock lock{wait_mutex};
-        written = true;
-        wait_cv.notify_all();
+    // The wait is bounded: while emulation stops, the fencing thread no longer runs operations
+    // and an unbounded wait kept the emulation thread from stopping. The state is shared so the
+    // operation stays valid when it runs after a timed-out wait.
+    struct WaitState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool written{};
+    };
+    const auto state = std::make_shared<WaitState>();
+    fence_manager.SyncOperation([state] {
+        std::scoped_lock lock{state->mutex};
+        state->written = true;
+        state->cv.notify_all();
     });
     fence_manager.SignalFence([] {});
     scheduler.FlushDeferred();
-    std::unique_lock lock{wait_mutex};
-    wait_cv.wait(lock, [&written] { return written; });
+    std::unique_lock lock{state->mutex};
+    if (!state->cv.wait_for(lock, std::chrono::milliseconds{100},
+                            [&state] { return state->written; })) {
+        static std::atomic<u64> timeouts{};
+        if (const u64 count = ++timeouts; count <= 8 || count % 1000 == 0) {
+            LOG_WARNING(Render_Vulkan, "Query results not written within 100 ms ({} so far)",
+                        count);
+        }
+    }
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
